@@ -50,6 +50,32 @@ find_bundle() {
     return 1
 }
 
+consume_private_bundle() {
+    # The bundle contains a reusable VPS administrator identity and is therefore
+    # strictly single-use on the phone. Only consume it after both local and VPS
+    # readiness have succeeded so a failed bootstrap remains deliberately retryable.
+    rm -f -- "$BUNDLE_PATH" 2>/dev/null || true
+    rm -f -- "${HOME}/${BUNDLE_NAME}" "${HOME}/storage/downloads/${BUNDLE_NAME}" 2>/dev/null || true
+    for p in \
+        "/sdcard/Download/${BUNDLE_NAME}" \
+        "/storage/emulated/0/Download/${BUNDLE_NAME}"
+    do
+        su -c "rm -f '$p'" >/dev/null 2>&1 || true
+    done
+
+    for p in "$BUNDLE_PATH" "${HOME}/${BUNDLE_NAME}" "${HOME}/storage/downloads/${BUNDLE_NAME}"; do
+        [ ! -f "$p" ] || die "Secret-bearing Android bundle remains after READY: $p"
+    done
+    for p in \
+        "/sdcard/Download/${BUNDLE_NAME}" \
+        "/storage/emulated/0/Download/${BUNDLE_NAME}"
+    do
+        if su -c "test -f '$p'" >/dev/null 2>&1; then
+            die "Secret-bearing Android bundle remains after READY: $p"
+        fi
+    done
+}
+
 BUNDLE_PATH="$(find_bundle || true)"
 [ -n "$BUNDLE_PATH" ] || die "${BUNDLE_NAME} not found in Termux HOME or Android Download."
 
@@ -149,8 +175,8 @@ chmod 600 "$ak"
 digest="$(printf '%s' "$pub" | sha256sum | awk '{print $1}')"
 seed_hex="${digest:0:6}"
 seed=$((16#$seed_hex))
-base=300
-span=3000
+base=2
+span=3651
 start=$((base + (seed % span)))
 
 chosen=''
@@ -313,6 +339,7 @@ chmod 700 "${STATE_ROOT}/launch.sh"
 "${STATE_ROOT}/launch.sh"
 
 PERSISTENCE='termux-session'
+REBOOT_PERSISTENT=false
 SERVICE_D='/data/adb/service.d'
 if su -c "test -d '${SERVICE_D}' && test -w '${SERVICE_D}'" >/dev/null 2>&1; then
     SU_BIN="$(command -v su)"
@@ -328,6 +355,7 @@ EOF
     chmod 700 "$BOOT_LOCAL"
     su -c "cp '$BOOT_LOCAL' '${SERVICE_D}/ctmw-etsa-${NODE_NAME}.sh' && chmod 755 '${SERVICE_D}/ctmw-etsa-${NODE_NAME}.sh'"
     PERSISTENCE='root-service.d'
+    REBOOT_PERSISTENT=true
 fi
 
 say 'Waiting for the dedicated localhost-only SSH endpoint...'
@@ -361,9 +389,10 @@ done
 [ "$REMOTE_READY" -eq 1 ] || die 'VPS reverse-tunnel listener did not become READY.'
 
 # The reusable VPS administrator key is needed only for initial enrollment and
-# READY verification. Keep the user's original one-file bundle untouched, but
-# do not retain the administrator key in the long-lived Termux state.
+# READY verification. Do not retain either the administrator key or the
+# consumed single-use bundle on the phone after READY succeeds.
 rm -f "${PRIVATE_ROOT}/vps_admin_key"
+consume_private_bundle
 
 cat > "${STATE_ROOT}/ready.env" <<EOF
 STATUS=READY
@@ -373,10 +402,12 @@ TARGET_SSH=127.0.0.1:${LOCAL_PORT}
 VPS_CONTROL=127.0.0.1:${CONTROL_PORT}
 VPS_HOST=${VPS_HOST}
 PERSISTENCE=${PERSISTENCE}
+REBOOT_PERSISTENT=${REBOOT_PERSISTENT}
 ROOT_LOGIN_DEFAULT=false
 PASSWORD_AUTH=false
 VPS_ADMIN_KEY_RETAINED=false
 OPERATOR_PRIVATE_KEY_ON_PHONE=false
+PRIVATE_BUNDLE_CONSUMED=true
 EOF
 chmod 600 "${STATE_ROOT}/ready.env"
 
@@ -389,10 +420,11 @@ printf 'Target SSH        : 127.0.0.1:%s (localhost only)\n' "$LOCAL_PORT"
 printf 'VPS control       : 127.0.0.1:%s\n' "$CONTROL_PORT"
 printf 'Route             : VPS 127.0.0.1:%s -> Android 127.0.0.1:%s\n' "$CONTROL_PORT" "$LOCAL_PORT"
 printf 'Persistence       : %s\n' "$PERSISTENCE"
+printf 'Reboot persistent : %s\n' "$REBOOT_PERSISTENT"
 printf 'Password auth     : disabled\n'
 printf 'Default SSH root  : disabled (explicit su only)\n'
 printf 'Operator key      : public key only on phone\n'
 printf 'VPS admin key     : removed from Termux state after READY\n'
-printf 'Bundle            : local-only; never uploaded\n'
+printf 'Bundle            : local-only; consumed after READY\n'
 printf '============================================================\n'
 
