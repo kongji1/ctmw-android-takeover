@@ -433,6 +433,8 @@ fi
 nohup "${STATE_ROOT}/supervisor.sh" >/dev/null 2>&1 &
 EOF
 chmod 700 "${STATE_ROOT}/launch.sh"
+cp -f "${STATE_ROOT}/launch.sh" "${STATE_ROOT}/launch-us.sh"
+chmod 700 "${STATE_ROOT}/launch-us.sh"
 
 "${STATE_ROOT}/launch.sh"
 
@@ -440,21 +442,76 @@ PERSISTENCE='termux-session'
 REBOOT_PERSISTENT=false
 LEGACY_SERVICE_D='/data/adb/service.d'
 LEGACY_SERVICE_FILE="${LEGACY_SERVICE_D}/ctmw-etsa-${NODE_NAME}.sh"
+LEGACY_SERVICE_ARCHIVE="${PRIVATE_ROOT}/legacy-boot-persistence/service-d"
 LEGACY_BOOT_LOCAL="${STATE_ROOT}/ctmw-etsa-android-boot.sh"
 TERMUX_BOOT_COMPONENT='com.termux/.app.TermuxBootReceiver'
+TERMUX_BOOT_CONFIG_DIR="${HOME}/.config/termux/boot"
 TERMUX_BOOT_DIR="${HOME}/.termux/boot"
 TERMUX_BOOT_SCRIPT="${TERMUX_BOOT_DIR}/ctmw-etsa-${NODE_NAME}.sh"
+TERMUX_BOOT_ARCHIVE="${PRIVATE_ROOT}/legacy-boot-persistence/termux-boot"
+
+archive_termux_boot_file() {
+    local src="$1" label="$2" base before_hash before_mode dest after_hash after_mode
+    [ -f "$src" ] || return 0
+    mkdir -p "$TERMUX_BOOT_ARCHIVE"
+    before_hash="$("$SHA256SUM" "$src" | awk '{print $1}')"
+    before_mode="$(stat -c '%a' "$src")"
+    base="${src##*/}"
+    dest="${TERMUX_BOOT_ARCHIVE}/${label}__${base}.${before_hash}"
+    mv -f -- "$src" "$dest" || die "Failed to archive stale Termux Boot entry: $src"
+    after_hash="$("$SHA256SUM" "$dest" | awk '{print $1}')"
+    after_mode="$(stat -c '%a' "$dest")"
+    if [ "$after_hash" != "$before_hash" ] || [ "$after_mode" != "$before_mode" ]; then
+        mv -f -- "$dest" "$src" 2>/dev/null || true
+        die "Archived Termux Boot entry failed byte/mode verification: $src"
+    fi
+}
+
+archive_root_service_file() {
+    local src="$1" base before_hash before_mode dest after_hash after_mode
+    [ -n "$src" ] || return 0
+    before_hash="$(su -c "sha256sum '$src'" | awk '{print $1}')"
+    before_mode="$(su -c "stat -c '%a' '$src'")"
+    base="${src##*/}"
+    dest="${LEGACY_SERVICE_ARCHIVE}/${base}.${before_hash}"
+    su -c "mkdir -p '$LEGACY_SERVICE_ARCHIVE'" || die "Failed to create legacy service.d archive"
+    su -c "mv -f '$src' '$dest'" || die "Failed to archive unsafe legacy root service.d persistence: $src"
+    after_hash="$(su -c "sha256sum '$dest'" | awk '{print $1}')"
+    after_mode="$(su -c "stat -c '%a' '$dest'")"
+    if [ "$after_hash" != "$before_hash" ] || [ "$after_mode" != "$before_mode" ]; then
+        su -c "mv -f '$dest' '$src'" >/dev/null 2>&1 || true
+        die "Archived legacy service.d entry failed byte/mode verification: $src"
+    fi
+}
 
 # Older releases used root service.d plus `su <termux-uid>` to launch the
 # supervisor. Root managers such as APatch can switch the numeric uid while
 # retaining a root-manager SELinux domain and dropping the app supplementary
 # groups. That makes Termux sshd fail StrictModes/setregid after reboot. Never
-# retain that adapter: the Android framework must create the Termux process in
-# its real app security context.
-if su -c "test -e '$LEGACY_SERVICE_FILE'" >/dev/null 2>&1; then
-    su -c "rm -f '$LEGACY_SERVICE_FILE'" || die "Failed to remove unsafe legacy root service.d persistence: ${LEGACY_SERVICE_FILE}"
-fi
+# retain that adapter as an automatic boot entry: the Android framework must
+# create the Termux process in its real app security context. Preserve every
+# historical node script byte-for-byte outside service.d for manual recovery.
+LEGACY_SERVICE_LIST="$(su -c "find '$LEGACY_SERVICE_D' -maxdepth 1 -type f -name 'ctmw-etsa-${NODE_NAME}.sh*' -print" 2>/dev/null || true)"
+while IFS= read -r legacy_service; do
+    [ -n "$legacy_service" ] || continue
+    archive_root_service_file "$legacy_service"
+done <<< "$LEGACY_SERVICE_LIST"
 rm -f "$LEGACY_BOOT_LOCAL"
+
+# Google Play TermuxBootReceiver enumerates every file under both supported
+# boot directories and can make a non-executable file executable before
+# dispatch. A backup-looking suffix is therefore still an active boot entry.
+# Archive all historical node318 siblings before publishing exactly one
+# canonical boot script.
+for boot_spec in "config:${TERMUX_BOOT_CONFIG_DIR}" "legacy:${TERMUX_BOOT_DIR}"; do
+    boot_label="${boot_spec%%:*}"
+    boot_dir="${boot_spec#*:}"
+    [ -d "$boot_dir" ] || continue
+    while IFS= read -r boot_entry; do
+        [ -n "$boot_entry" ] || continue
+        archive_termux_boot_file "$boot_entry" "$boot_label"
+    done < <(find "$boot_dir" -maxdepth 1 -type f -name "ctmw-etsa-${NODE_NAME}.sh*" -print)
+done
 
 TERMUX_BOOT_QUERY="$(su -c "cmd package query-receivers --brief --components -a android.intent.action.BOOT_COMPLETED -p com.termux 2>/dev/null" || true)"
 if printf '%s\n' "$TERMUX_BOOT_QUERY" | grep -Fxq "$TERMUX_BOOT_COMPONENT"; then
@@ -463,7 +520,13 @@ if printf '%s\n' "$TERMUX_BOOT_QUERY" | grep -Fxq "$TERMUX_BOOT_COMPONENT"; then
 #!/data/data/com.termux/files/usr/bin/sh
 STATE_ROOT='${STATE_ROOT}'
 [ -e "\${STATE_ROOT}/disable" ] && exit 0
-exec "\${STATE_ROOT}/launch.sh"
+US_RC=0
+"\${STATE_ROOT}/launch-us.sh" || US_RC=\$?
+KR_RC=0
+if [ -x "\${STATE_ROOT}/launch-kr.sh" ]; then
+    "\${STATE_ROOT}/launch-kr.sh" || KR_RC=\$?
+fi
+[ "\$US_RC" -eq 0 ] && [ "\$KR_RC" -eq 0 ]
 EOF
     chmod 700 "$TERMUX_BOOT_SCRIPT"
     PERSISTENCE='termux-boot-receiver'
