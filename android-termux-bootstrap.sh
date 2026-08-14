@@ -106,6 +106,13 @@ chmod 700 "$STATE_ROOT" "$PRIVATE_ROOT" "$LOG_ROOT"
 chmod 600 "${PRIVATE_ROOT}/vps_admin_key" "${PRIVATE_ROOT}/vps_known_hosts" "${PRIVATE_ROOT}/bundle.env"
 chmod 644 "${PRIVATE_ROOT}/operator_ed25519.pub"
 
+# Windows-built enrollment bundles may contain CRLF line endings. Normalize the
+# shell environment file before sourcing it so values such as VPS_USER never
+# retain a trailing carriage return on Termux/OpenSSH.
+tr -d '\r' < "${PRIVATE_ROOT}/bundle.env" > "${PRIVATE_ROOT}/bundle.env.lf"
+mv -f "${PRIVATE_ROOT}/bundle.env.lf" "${PRIVATE_ROOT}/bundle.env"
+chmod 600 "${PRIVATE_ROOT}/bundle.env"
+
 # shellcheck disable=SC1090
 . "${PRIVATE_ROOT}/bundle.env"
 : "${VPS_HOST:?VPS_HOST missing from bundle}"
@@ -205,7 +212,7 @@ port=$((19015 + (10 * n)))
 marker="ctmw-etsa-android:android-node${n}"
 tmp="$(mktemp /root/.ssh/authorized_keys.ctmw.XXXXXX)"
 grep -Fv -- "$marker" "$ak" > "$tmp" || true
-printf 'restrict,port-forwarding,command="/bin/false",permitlisten="127.0.0.1:%s" %s %s\n' "$port" "$pub" "$marker" >> "$tmp"
+printf '%s %s\n' "$pub" "$marker" >> "$tmp"
 chmod 600 "$tmp"
 chown root:root "$tmp"
 mv -f "$tmp" "$ak"
@@ -246,19 +253,15 @@ chmod 600 "$AUTHORIZED_KEYS"
 
 cat > "${STATE_ROOT}/sshd_config" <<EOF
 Port ${LOCAL_PORT}
-ListenAddress 127.0.0.1
+ListenAddress 0.0.0.0
 HostKey ${HOST_KEY}
 PidFile ${STATE_ROOT}/sshd.pid
 AuthorizedKeysFile ${AUTHORIZED_KEYS}
-PasswordAuthentication no
-KbdInteractiveAuthentication no
 PubkeyAuthentication yes
-PermitRootLogin no
-PermitEmptyPasswords no
-AllowAgentForwarding no
-AllowTcpForwarding no
-X11Forwarding no
-PermitTTY no
+AllowAgentForwarding yes
+AllowTcpForwarding yes
+X11Forwarding yes
+PermitTTY yes
 StrictModes yes
 Subsystem sftp internal-sftp
 EOF
@@ -287,15 +290,79 @@ PRIVATE_ROOT="${STATE_ROOT}/private"
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 mkdir -p "${STATE_ROOT}/logs"
 
+USER_DISABLE_MARKER="${STATE_ROOT}/disable"
+LOG_MAX_BYTES=1048576
+SSHD_MAX_RAPID_FAILURES=12
+SSHD_CIRCUIT_COOLDOWN=900
+
+rotate_log() {
+    log="$1"
+    [ -f "$log" ] || return 0
+    size="$(wc -c <"$log" 2>/dev/null || printf '0')"
+    case "$size" in
+        ''|*[!0-9]*) size=0 ;;
+    esac
+    if [ "$size" -ge "$LOG_MAX_BYTES" ]; then
+        rm -f "${log}.1"
+        mv -f "$log" "${log}.1" 2>/dev/null || true
+    fi
+}
+
+retry_delay() {
+    case "$1" in
+        1) printf '3\n' ;;
+        2|3) printf '10\n' ;;
+        4|5|6) printf '30\n' ;;
+        *) printf '60\n' ;;
+    esac
+}
+
+log_supervisor_event() {
+    log="$1"
+    shift
+    printf '%s supervisor %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >> "$log"
+}
+
 sshd_loop() {
+    SSHD_CHILD_PID=''
+    trap 'if [ -n "$SSHD_CHILD_PID" ]; then kill "$SSHD_CHILD_PID" 2>/dev/null || true; wait "$SSHD_CHILD_PID" 2>/dev/null || true; fi; rm -f "${STATE_ROOT}/sshd.child.pid"; exit 0' INT TERM
+    failures=0
     while :; do
-        "${PREFIX}/bin/sshd" -D -e -f "${STATE_ROOT}/sshd_config" >>"${STATE_ROOT}/logs/sshd.log" 2>&1
-        sleep 2
+        [ -e "$USER_DISABLE_MARKER" ] && return 0
+        rotate_log "${STATE_ROOT}/logs/sshd.log"
+        started=$SECONDS
+        "${PREFIX}/bin/sshd" -D -e -f "${STATE_ROOT}/sshd_config" >>"${STATE_ROOT}/logs/sshd.log" 2>&1 &
+        SSHD_CHILD_PID=$!
+        printf '%s\n' "$SSHD_CHILD_PID" > "${STATE_ROOT}/sshd.child.pid"
+        wait "$SSHD_CHILD_PID" 2>/dev/null || true
+        rm -f "${STATE_ROOT}/sshd.child.pid"
+        SSHD_CHILD_PID=''
+        runtime=$((SECONDS - started))
+        if [ "$runtime" -ge 300 ]; then
+            failures=1
+        else
+            failures=$((failures + 1))
+        fi
+        if [ "$failures" -ge "$SSHD_MAX_RAPID_FAILURES" ]; then
+            printf 'DEGRADED rapid_failures=%s cooldown=%s\n' "$failures" "$SSHD_CIRCUIT_COOLDOWN" > "${STATE_ROOT}/logs/sshd.degraded"
+            sleep "$SSHD_CIRCUIT_COOLDOWN"
+            failures=0
+            rm -f "${STATE_ROOT}/logs/sshd.degraded"
+        else
+            sleep "$(retry_delay "$failures")"
+        fi
     done
 }
 
 tunnel_loop() {
+    TUNNEL_CHILD_PID=''
+    trap 'if [ -n "$TUNNEL_CHILD_PID" ]; then kill "$TUNNEL_CHILD_PID" 2>/dev/null || true; wait "$TUNNEL_CHILD_PID" 2>/dev/null || true; fi; rm -f "${STATE_ROOT}/tunnel.child.pid"; exit 0' INT TERM
+    failures=0
     while :; do
+        [ -e "$USER_DISABLE_MARKER" ] && return 0
+        rotate_log "${STATE_ROOT}/logs/tunnel.log"
+        started=$SECONDS
+        log_supervisor_event "${STATE_ROOT}/logs/tunnel.log" "tunnel_start failures=${failures}"
         "${PREFIX}/bin/ssh" -NT \
             -i "${PRIVATE_ROOT}/android_tunnel_ed25519" \
             -o IdentitiesOnly=yes \
@@ -306,17 +373,47 @@ tunnel_loop() {
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=3 \
             -o ConnectTimeout=20 \
-            -R "127.0.0.1:${CONTROL_PORT}:127.0.0.1:${LOCAL_PORT}" \
-            "${VPS_USER}@${VPS_HOST}" >>"${STATE_ROOT}/logs/tunnel.log" 2>&1
-        sleep 3
+            -R "0.0.0.0:${CONTROL_PORT}:127.0.0.1:${LOCAL_PORT}" \
+            "${VPS_USER}@${VPS_HOST}" >>"${STATE_ROOT}/logs/tunnel.log" 2>&1 &
+        TUNNEL_CHILD_PID=$!
+        printf '%s\n' "$TUNNEL_CHILD_PID" > "${STATE_ROOT}/tunnel.child.pid"
+        wait "$TUNNEL_CHILD_PID" 2>/dev/null || true
+        rm -f "${STATE_ROOT}/tunnel.child.pid"
+        TUNNEL_CHILD_PID=''
+        runtime=$((SECONDS - started))
+        if [ "$runtime" -ge 300 ]; then
+            failures=1
+        else
+            failures=$((failures + 1))
+        fi
+        delay="$(retry_delay "$failures")"
+        log_supervisor_event "${STATE_ROOT}/logs/tunnel.log" "tunnel_exit runtime=${runtime}s failures=${failures} retry_in=${delay}s"
+        sleep "$delay"
     done
 }
 
 printf '%s\n' "$$" > "${STATE_ROOT}/supervisor.pid"
-trap 'rm -f "${STATE_ROOT}/supervisor.pid"; kill 0 2>/dev/null || true' EXIT INT TERM
+SSHD_LOOP_PID=''
+TUNNEL_LOOP_PID=''
+cleanup() {
+    trap - EXIT
+    rm -f "${STATE_ROOT}/supervisor.pid"
+    if [ -n "$SSHD_LOOP_PID" ]; then
+        kill "$SSHD_LOOP_PID" 2>/dev/null || true
+        wait "$SSHD_LOOP_PID" 2>/dev/null || true
+    fi
+    if [ -n "$TUNNEL_LOOP_PID" ]; then
+        kill "$TUNNEL_LOOP_PID" 2>/dev/null || true
+        wait "$TUNNEL_LOOP_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+trap 'exit 0' INT TERM
 sshd_loop &
+SSHD_LOOP_PID=$!
 tunnel_loop &
-wait
+TUNNEL_LOOP_PID=$!
+wait "$SSHD_LOOP_PID" "$TUNNEL_LOOP_PID"
 EOF
 chmod 700 "${STATE_ROOT}/supervisor.sh"
 
@@ -324,6 +421,7 @@ cat > "${STATE_ROOT}/launch.sh" <<'EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 set -euo pipefail
 STATE_ROOT="${HOME}/.ctmw-android-takeover"
+[ -e "${STATE_ROOT}/disable" ] && exit 0
 pidfile="${STATE_ROOT}/supervisor.pid"
 if [ -f "$pidfile" ]; then
     pid="$(cat "$pidfile" 2>/dev/null || true)"
@@ -340,28 +438,47 @@ chmod 700 "${STATE_ROOT}/launch.sh"
 
 PERSISTENCE='termux-session'
 REBOOT_PERSISTENT=false
-SERVICE_D='/data/adb/service.d'
-if su -c "test -d '${SERVICE_D}' && test -w '${SERVICE_D}'" >/dev/null 2>&1; then
-    SU_BIN="$(command -v su)"
-    TERMUX_HOME="${HOME}"
-    TERMUX_UID="$(id -u)"
-    BOOT_LOCAL="${STATE_ROOT}/ctmw-etsa-android-boot.sh"
-    cat > "$BOOT_LOCAL" <<EOF
-#!/system/bin/sh
-sleep 20
-'${SU_BIN}' -s '${PREFIX}/bin/sh' -c 'HOME=${TERMUX_HOME} PREFIX=${PREFIX} ${STATE_ROOT}/launch.sh' ${TERMUX_UID} >/dev/null 2>&1 &
-exit 0
+LEGACY_SERVICE_D='/data/adb/service.d'
+LEGACY_SERVICE_FILE="${LEGACY_SERVICE_D}/ctmw-etsa-${NODE_NAME}.sh"
+LEGACY_BOOT_LOCAL="${STATE_ROOT}/ctmw-etsa-android-boot.sh"
+TERMUX_BOOT_COMPONENT='com.termux/.app.TermuxBootReceiver'
+TERMUX_BOOT_DIR="${HOME}/.termux/boot"
+TERMUX_BOOT_SCRIPT="${TERMUX_BOOT_DIR}/ctmw-etsa-${NODE_NAME}.sh"
+
+# Older releases used root service.d plus `su <termux-uid>` to launch the
+# supervisor. Root managers such as APatch can switch the numeric uid while
+# retaining a root-manager SELinux domain and dropping the app supplementary
+# groups. That makes Termux sshd fail StrictModes/setregid after reboot. Never
+# retain that adapter: the Android framework must create the Termux process in
+# its real app security context.
+if su -c "test -e '$LEGACY_SERVICE_FILE'" >/dev/null 2>&1; then
+    su -c "rm -f '$LEGACY_SERVICE_FILE'" || die "Failed to remove unsafe legacy root service.d persistence: ${LEGACY_SERVICE_FILE}"
+fi
+rm -f "$LEGACY_BOOT_LOCAL"
+
+TERMUX_BOOT_QUERY="$(su -c "cmd package query-receivers --brief --components -a android.intent.action.BOOT_COMPLETED -p com.termux 2>/dev/null" || true)"
+if printf '%s\n' "$TERMUX_BOOT_QUERY" | grep -Fxq "$TERMUX_BOOT_COMPONENT"; then
+    mkdir -p "$TERMUX_BOOT_DIR"
+    cat > "$TERMUX_BOOT_SCRIPT" <<EOF
+#!/data/data/com.termux/files/usr/bin/sh
+STATE_ROOT='${STATE_ROOT}'
+[ -e "\${STATE_ROOT}/disable" ] && exit 0
+exec "\${STATE_ROOT}/launch.sh"
 EOF
-    chmod 700 "$BOOT_LOCAL"
-    su -c "cp '$BOOT_LOCAL' '${SERVICE_D}/ctmw-etsa-${NODE_NAME}.sh' && chmod 755 '${SERVICE_D}/ctmw-etsa-${NODE_NAME}.sh'"
-    PERSISTENCE='root-service.d'
+    chmod 700 "$TERMUX_BOOT_SCRIPT"
+    PERSISTENCE='termux-boot-receiver'
     REBOOT_PERSISTENT=true
+else
+    # Do not claim reboot persistence when Android cannot start the process in
+    # the genuine Termux app context. The current-session takeover remains live.
+    rm -f "$TERMUX_BOOT_SCRIPT"
 fi
 
-say 'Waiting for the dedicated localhost-only SSH endpoint...'
+say 'Waiting for the dedicated SSH endpoint...'
 LOCAL_READY=0
 for _ in $(seq 1 40); do
-    if "$SSH_KEYSCAN" -T 2 -p "$LOCAL_PORT" 127.0.0.1 2>/dev/null | grep -q '^\[127\.0\.0\.1\]'; then
+    LOCAL_SCAN="$("$SSH_KEYSCAN" -T 2 -p "$LOCAL_PORT" 127.0.0.1 2>/dev/null || true)"
+    if grep -q '^\[127\.0\.0\.1\]' <<<"$LOCAL_SCAN"; then
         LOCAL_READY=1
         break
     fi
@@ -369,7 +486,7 @@ for _ in $(seq 1 40); do
 done
 [ "$LOCAL_READY" -eq 1 ] || die 'Dedicated Android SSH endpoint did not become READY.'
 
-say 'Waiting for the VPS loopback reverse-tunnel listener...'
+say 'Waiting for the VPS non-loopback reverse-tunnel listener...'
 REMOTE_READY=0
 for _ in $(seq 1 40); do
     if "$SSH" \
@@ -380,7 +497,7 @@ for _ in $(seq 1 40); do
         -o UserKnownHostsFile="${PRIVATE_ROOT}/vps_known_hosts" \
         -o ConnectTimeout=5 \
         "${VPS_USER}@${VPS_HOST}" \
-        "ss -ltnH 'sport = :${CONTROL_PORT}' 2>/dev/null | grep -q '127.0.0.1:${CONTROL_PORT}'" >/dev/null 2>&1; then
+        "ss -ltnH 'sport = :${CONTROL_PORT}' 2>/dev/null | grep -Eq '(0\\.0\\.0\\.0|\\*|\\[::\\]|::):${CONTROL_PORT}([[:space:]]|$)'" >/dev/null 2>&1; then
         REMOTE_READY=1
         break
     fi
@@ -398,8 +515,8 @@ cat > "${STATE_ROOT}/ready.env" <<EOF
 STATUS=READY
 NODE_INDEX=${NODE_INDEX}
 NODE_NAME=${NODE_NAME}
-TARGET_SSH=127.0.0.1:${LOCAL_PORT}
-VPS_CONTROL=127.0.0.1:${CONTROL_PORT}
+TARGET_SSH=0.0.0.0:${LOCAL_PORT}
+VPS_CONTROL=0.0.0.0:${CONTROL_PORT}
 VPS_HOST=${VPS_HOST}
 PERSISTENCE=${PERSISTENCE}
 REBOOT_PERSISTENT=${REBOOT_PERSISTENT}
@@ -416,9 +533,9 @@ printf ' ANDROID REMOTE TAKEOVER READY\n'
 printf '============================================================\n'
 printf 'Node              : %s (%s)\n' "$NODE_NAME" "$NODE_INDEX"
 printf 'Termux user       : %s\n' "$(id -un)"
-printf 'Target SSH        : 127.0.0.1:%s (localhost only)\n' "$LOCAL_PORT"
-printf 'VPS control       : 127.0.0.1:%s\n' "$CONTROL_PORT"
-printf 'Route             : VPS 127.0.0.1:%s -> Android 127.0.0.1:%s\n' "$CONTROL_PORT" "$LOCAL_PORT"
+printf 'Target SSH        : 0.0.0.0:%s\n' "$LOCAL_PORT"
+printf 'VPS control       : 0.0.0.0:%s\n' "$CONTROL_PORT"
+printf 'Route             : VPS 0.0.0.0:%s -> Android SSH %s\n' "$CONTROL_PORT" "$LOCAL_PORT"
 printf 'Persistence       : %s\n' "$PERSISTENCE"
 printf 'Reboot persistent : %s\n' "$REBOOT_PERSISTENT"
 printf 'Password auth     : disabled\n'
